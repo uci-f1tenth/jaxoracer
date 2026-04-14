@@ -59,18 +59,6 @@ wheels = [
 ]
 
 [[package]]
-name = "jax-mps"
-version = "0.9.13"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "jax" },
-    { name = "jaxlib" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/d7/f6/fa7a30b05945f0292818635351e734b4ca4abb370bb561bf516c3b1ce474/jax_mps-0.9.13-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:ed722305ed13e233bccc17dda45ddc925d36bad07273d18e9f41e1c34c1214c7", size = 43699502, upload-time = "2026-04-14T14:35:35.985Z" },
-]
-
-[[package]]
 name = "jaxlib"
 version = "0.9.2"
 source = { registry = "https://pypi.org/simple" }
@@ -102,7 +90,6 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "jax" },
-    { name = "jax-mps" },
     { name = "optax" },
     { name = "pillow" },
     { name = "pyyaml" },
@@ -115,7 +102,6 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "jax", specifier = ">=0.9.2" },
-    { name = "jax-mps", specifier = ">=0.9.13" },
     { name = "optax", specifier = ">=0.2.8" },
     { name = "pillow", specifier = ">=12.2.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },
