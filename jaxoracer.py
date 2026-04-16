@@ -10,47 +10,63 @@ import wandb
 
 
 class Map:
+    def __init__(self, path: Path) -> None:
+        with open(path, "r") as f:
+            self.meta = yaml.safe_load(f)
+        raw = cv2.imread(str(path.parent / self.meta["image"]), cv2.IMREAD_GRAYSCALE)
+        if raw is None:
+            raise FileNotFoundError(f"Error reading {path.parent / self.meta['image']}")
+        self.occupied = jnp.asarray(raw < 128)
+
+        cast_all = jax.vmap(jax.vmap(jax.vmap(     # fmt: skip
+             Map.cast_ray, (None, None, None, 0)), # fmt: skip
+                           (None, None, 0, None)), # fmt: skip
+                           (None, 0, None, None))  # fmt: skip
+        self.lookup_table = cast_all(
+            self.occupied,
+            jnp.arange(self.occupied.shape[0]),
+            jnp.arange(self.occupied.shape[1]),
+            jnp.linspace(0, 2 * jnp.pi, 360),
+        )
+
     @staticmethod
+    @jax.jit
     def cast_ray(
-        image: jax.Array,
-        x: jax.Array,
-        y: jax.Array,
+        occupied: jax.Array,
+        start_row: jax.Array,
+        start_col: jax.Array,
         theta: jax.Array,
     ):
         c, s = jnp.cos(theta), -jnp.sin(theta)
 
-        def step(carry, _):
-            t, hit = carry
-            col = jnp.round(x + t * c).astype(jnp.int32)
-            row = jnp.round(y + t * s).astype(jnp.int32)
-            hit = hit | (0 <= col) & (col < image.shape[1]) & (0 <= row) & (
-                row < image.shape[0]
+        @jax.jit
+        def is_occ(t):
+            row = jnp.int32(jnp.round(start_row + t * c))
+            col = jnp.int32(jnp.round(start_col + t * s))
+            return (
+                col
+                < 0 | col
+                >= occupied.shape[1] | row
+                < 0 | row
+                >= occupied.shape[0] | occupied[row, col]
             )
-            t = jnp.where(hit, t, t + 1.0)
-            return (t, hit), None
 
-        w, h = image.shape
-        _, hit = jax.lax.scan(step, (0.0, False), None, length=int(jnp.hypot(w, h)))
-        return hit
+        @jax.jit
+        def step(t):
+            return t + 1.0
 
-    def __init__(self, yaml_path: Path) -> None:
-        self.yaml_path = yaml_path
-        with open(yaml_path, "r") as f:
-            self.meta = yaml.safe_load(f)
-        self.image_path: Path = yaml_path.parent / self.meta["image"]
-        self.image = jnp.asarray(cv2.imread(str(self.image_path), cv2.IMREAD_GRAYSCALE))
-        self.resolution = self.meta["resolution"]
-        self.origin_x, self.origin_y, self.origin_theta = self.meta["origin"]
+        # def step(carry, _):
+        #     t, hit = carry
+        #     row = jnp.int32(jnp.round(start_row + t * c))
+        #     col = jnp.int32(jnp.round(start_col + t * s))
 
-        vmap_theta = jax.vmap(Map.cast_ray, in_axes=(None, None, None, 0))
-        vmap_y = jax.vmap(vmap_theta, in_axes=(None, None, 0, None))
-        vmap_x = jax.vmap(vmap_y, in_axes=(None, 0, None, None))
-        self.lookup_table = vmap_x(
-            self.image,
-            jnp.arange(self.image.shape[0]),
-            jnp.arange(self.image.shape[1]),
-            jnp.linspace(0, 2 * jnp.pi, 360),
-        )
+        #     hit = hit | (0 <= col) & (col < occupied.shape[1]) & (0 <= row) & (
+        #         row < occupied.shape[0]
+        #     )
+        #     t = jnp.where(hit, t, t + 1.0)
+        #     return (t, hit), None
+
+        return jax.lax.while_loop(is_occ, step, 0.0)
 
 
 def main(yaml_path: Path, num_envs: int = 1024, seed: int = 42):
