@@ -222,9 +222,16 @@ class Environment:
 
         return jnp.concatenate([lidar, jnp.array([speed, lat_offset, rel_heading])])
 
+    def _step(self, state, action, key):
+        x, y, theta, speed, prog_idx = state
+        prog_idx = jnp.int32(prog_idx)
+
     @partial(jax.jit, static_argnums=(0,))
-    def step(self, state, action):
-        state, key = state
+    def step(self, state, action, key):
+        key, subkey = jax.random.split(key)
+        state = self._step(state, action, subkey)
+        obs = self._get_obsv(state)
+        return state, obs, key
 
     def _reset(self, key):
         cl = self.map.centerline_world
@@ -243,12 +250,12 @@ class Environment:
 
 def main(
     yaml_path: Path,
-    num_envs: int = 1024,
     seed: int = 42,
+    num_envs: int = 1024,
     lidar_range: float = 20.0,
     n_beams: int = 108,
     fov_deg: float = 270.0,
-    n_lookup_angles: int = 108 * 5,
+    n_lookup_angles: int = 108 * 10,
 ):
     init("jaxoracer", spawn=True)
     env = Environment(yaml_path, lidar_range, n_beams, fov_deg, n_lookup_angles)
