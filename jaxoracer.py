@@ -47,7 +47,7 @@ class Map:
             * self.resolution
         )
 
-    @partial(jax.jit, static_argnums=(0,))
+    @partial(jax.jit, static_argnums=(0, 2))
     def build_lookup(self, max_steps: float, n_lookup_angles: int):
         h, w = self.occupied.shape
         angles = jnp.linspace(0, 2 * jnp.pi, n_lookup_angles, endpoint=False)
@@ -248,32 +248,10 @@ def main(
     lidar_range: float = 20.0,
     n_beams: int = 108,
     fov_deg: float = 270.0,
-    n_lookup_angles: int = 108 * 3,
+    n_lookup_angles: int = 108 * 5,
 ):
     init("jaxoracer", spawn=True)
     env = Environment(yaml_path, lidar_range, n_beams, fov_deg, n_lookup_angles)
-
-    # h, w = map_.occupied.shape
-    # ox, oy, _ = map_.origin
-    # origin_col = int(-ox / map_.resolution)
-    # origin_row = int(h - 1 + oy / map_.resolution)
-
-    # distances = np.asarray(map_.lookup[origin_row, origin_col])
-    # angles = np.linspace(0, 2 * np.pi, 360)
-
-    # endpoints_x = origin_col + (distances / map_.resolution) * np.cos(angles)
-    # endpoints_y = origin_row - (distances / map_.resolution) * np.sin(angles)
-
-    # rr.log(
-    #     "map/origin",
-    #     rr.Points2D([[origin_col, origin_row]], radii=3, colors=[[255, 0, 0]]),
-    # )
-    # rr.log(
-    #     "map/lidar",
-    #     rr.Points2D(
-    #         np.column_stack([endpoints_x, endpoints_y]), radii=1, colors=[[0, 255, 0]]
-    #     ),
-    # )
 
 
 if __name__ == "__main__":
