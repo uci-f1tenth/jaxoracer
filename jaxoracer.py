@@ -14,7 +14,7 @@ from yaml import safe_load
 
 
 class Map:
-    def __init__(self, path: Path, lidar_range: float) -> None:
+    def __init__(self, path: Path, lidar_range: float, n_lookup_angles: int) -> None:
         with open(path, "r") as f:
             self.meta = safe_load(f)
 
@@ -27,15 +27,21 @@ class Map:
         self.resolution = self.meta["resolution"]
         self.origin = self.meta["origin"]
         self.dt = jnp.asarray(distance_transform_edt(~occ))
+        self.n_lookup_angles = n_lookup_angles
+
         log("map", Image(raw))
         log("dt", Image(self.dt))
         self.compute_centerline(raw)
-        self.lookup = self.build_lookup(lidar_range / self.resolution) * self.resolution
+
+        self.lookup = (
+            self.build_lookup(lidar_range / self.resolution, n_lookup_angles)
+            * self.resolution
+        )
 
     @partial(jax.jit, static_argnums=(0,))
     def build_lookup(self, max_steps: float):
         h, w = self.occupied.shape
-        angles = jnp.linspace(0, 2 * jnp.pi, 360)
+        angles = jnp.linspace(0, 2 * jnp.pi, n_lookup_angles)
 
         def cast(row, col, dc, dr):
             return Map._cast_ray(self.dt, row, col, dc, dr, max_steps)
@@ -101,7 +107,7 @@ class Map:
         w = min(smooth_window, len(world) // 2 * 2 - 1)
         if w >= 5:
             world = jnp.column_stack(
-                [
+                [  # pyright: ignore[reportArgumentType]
                     savgol_filter(world[:, 0], w, 3, mode="wrap"),
                     savgol_filter(world[:, 1], w, 3, mode="wrap"),
                 ]
@@ -131,25 +137,62 @@ class Map:
             d = jnp.where(
                 in_bounds, dt[jnp.clip(r, 0, h - 1), jnp.clip(c, 0, w - 1)], 0.0
             )
-            hit = (d < 1.0) | ~in_bounds
-            new_t = jnp.minimum(t + jnp.maximum(d, 1.0), max_steps)
+            hit = (d < 1.0) | ~in_bounds  # pyright: ignore[reportOperatorIssue]
+            new_t = jnp.minimum(t + jnp.maximum(d, 1.0), max_steps)  # pyright: ignore[reportArgumentType]
             new_done = done | hit
-            return (jnp.where(done, t, jnp.where(new_done, t, new_t)), new_done), None
+            return (jnp.where(done, t, jnp.where(new_done, t, new_t)), new_done), None  # pyright: ignore[reportCallIssue, reportArgumentType]
 
         (dist, _), _ = jax.lax.scan(step, (jnp.float32(0.0), False), None, length=32)
         return dist
 
 
 class Environment:
-    def __init__(self, path: Path, lidar_range: float, seed=42):
-        self.map = Map(path, lidar_range)
+    def __init__(
+        self,
+        path: Path,
+        lidar_range: float,
+        n_beams: int = 108,
+        fov_deg: float = 270.0,
+        n_lookup_angles: int = 360,
+        seed=42,
+    ):
+        self.n_beams = n_beams
+        self.fov = jnp.radians(fov_deg)
+        self.n_lookup_angles = n_lookup_angles
+        self.map = Map(path, lidar_range, n_lookup_angles)
+
+        cl = self.map.centerline_world  # (N, 2)
+        diffs = jnp.diff(cl, axis=0, append=cl[:1])
+        self.angles = jnp.arctan2(diffs[:, 1], diffs[:, 0])  # (N,)
+        seg_lens = jnp.sqrt((diffs**2).sum(axis=1))
+        self.cum_dist = jnp.cumsum(seg_lens)  # (N,)
+        self.track_length = self.cum_dist[-1]
+        self.n_waypoints = cl.shape[0]
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _world_to_px(self, x, y):
+        """world (x, y) → pixel (row, col) as float."""
+        h = self.map.occupied.shape[0]
+        ox, oy, _ = self.map.origin
+        res = self.map.resolution
+        col = (x - ox) / res
+        row = h - 1 - (y - oy) / res
+        return row, col
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _get_obsv(self, state):
+        x, y, theta, speed, prog_idx, step = state
+        row, col = self._world_to_px(x, y)
+        h, w = self.map.occupied.shape
+
+        r_idx = jnp.clip(jnp.int32(jnp.round(row)), 0, h - 1)
+        c_idx = jnp.clip(jnp.int32(jnp.round(col)), 0, w - 1)
+
+        pass  # TODO
 
     @partial(jax.jit, static_argnums=(0,))
     def step(self, state, action):
         state, key = state
-
-    def _get_obsv(self, state):
-        pass  # TODO
 
     def _maybe_reset(self, state, done):
         key = state[1]
@@ -167,10 +210,16 @@ class Environment:
 
 
 def main(
-    yaml_path: Path, num_envs: int = 1024, seed: int = 42, lidar_range: float = 20.0
+    yaml_path: Path,
+    num_envs: int = 1024,
+    seed: int = 42,
+    lidar_range: float = 20.0,
+    n_beams: int = 108,
+    fov_deg: float = 270.0,
+    n_lookup_angles: int = 108 * 3,
 ):
     init("jaxoracer", spawn=True)
-    map = Map(yaml_path, lidar_range)
+    env = Environment(yaml_path, lidar_range, n_beams, fov_deg, n_lookup_angles)
 
     # h, w = map_.occupied.shape
     # ox, oy, _ = map_.origin
