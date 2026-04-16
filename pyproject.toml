@@ -3,16 +3,12 @@ name = "jaxoracer"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 dependencies = [
     "av>=17.0.0",
     "jax>=0.9.2",
-    "optax>=0.2.8",
-    "pillow>=12.2.0",
+    "opencv-python>=4.13.0.92",
     "pyyaml>=6.0.3",
-    "scikit-image>=0.26.0",
-    "scipy>=1.17.1",
-    "tqdm>=4.67.3",
-    "tyro>=1.0.12",
+    "typer>=0.24.1",
     "wandb>=0.26.0",
 ]
