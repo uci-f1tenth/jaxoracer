@@ -13,6 +13,15 @@ from typer import run
 from yaml import safe_load
 
 
+def round_int(x):
+    return jnp.int32(jnp.round(x))
+
+
+def wrap_angle(a):
+    """Wrap angle to [-π, π)."""
+    return (a + jnp.pi) % (2 * jnp.pi) - jnp.pi
+
+
 class Map:
     def __init__(self, path: Path, lidar_range: float, n_lookup_angles: int) -> None:
         with open(path, "r") as f:
@@ -39,9 +48,9 @@ class Map:
         )
 
     @partial(jax.jit, static_argnums=(0,))
-    def build_lookup(self, max_steps: float):
+    def build_lookup(self, max_steps: float, n_lookup_angles: int):
         h, w = self.occupied.shape
-        angles = jnp.linspace(0, 2 * jnp.pi, n_lookup_angles)
+        angles = jnp.linspace(0, 2 * jnp.pi, n_lookup_angles, endpoint=False)
 
         def cast(row, col, dc, dr):
             return Map._cast_ray(self.dt, row, col, dc, dr, max_steps)
@@ -57,7 +66,7 @@ class Map:
         skel = skeletonize(drivable_area > 230)
         log("skeleton", Image((skel * 255).astype(jnp.uint8)))
 
-        fg = set(map(tuple, jnp.argwhere(skel).tolist()))  # {(row, col), ...}
+        fg = set(map(tuple, jnp.argwhere(skel).tolist()))
 
         def adj(p):
             r, c = p
@@ -70,7 +79,8 @@ class Map:
 
         h = skel.shape[0]
         ox, oy, _ = self.origin
-        orow, ocol = h - 1 + oy / self.resolution, -ox / self.resolution
+        orow = h - 1 + oy / self.resolution
+        ocol = -ox / self.resolution
         start = min(fg, key=lambda p: (p[0] - orow) ** 2 + (p[1] - ocol) ** 2)
 
         nbrs = adj(start)
@@ -125,22 +135,28 @@ class Map:
             LineStrips2D([self.centerline_px], colors=[[255, 0, 0]]),
         )
 
+    # ray marching is unchanged -----------------------------------------
     @staticmethod
     def _cast_ray(dt, row, col, dc, dr, max_steps):
         h, w = dt.shape
 
         def step(state, _):
             t, done = state
-            r = jnp.int32(jnp.round(row + t * dr))
-            c = jnp.int32(jnp.round(col + t * dc))
+            r = round_int(row + t * dr)
+            c = round_int(col + t * dc)
             in_bounds = (0 <= r) & (r < h) & (0 <= c) & (c < w)
             d = jnp.where(
-                in_bounds, dt[jnp.clip(r, 0, h - 1), jnp.clip(c, 0, w - 1)], 0.0
+                in_bounds,
+                dt[jnp.clip(r, 0, h - 1), jnp.clip(c, 0, w - 1)],
+                0.0,
             )
             hit = (d < 1.0) | ~in_bounds  # pyright: ignore[reportOperatorIssue]
             new_t = jnp.minimum(t + jnp.maximum(d, 1.0), max_steps)  # pyright: ignore[reportArgumentType]
             new_done = done | hit
-            return (jnp.where(done, t, jnp.where(new_done, t, new_t)), new_done), None  # pyright: ignore[reportCallIssue, reportArgumentType]
+            return (
+                jnp.where(done, t, jnp.where(new_done, t, new_t)),  # pyright: ignore[reportCallIssue, reportArgumentType]
+                new_done,
+            ), None
 
         (dist, _), _ = jax.lax.scan(step, (jnp.float32(0.0), False), None, length=32)
         return dist
@@ -151,15 +167,16 @@ class Environment:
         self,
         path: Path,
         lidar_range: float,
-        n_beams: int = 108,
-        fov_deg: float = 270.0,
-        n_lookup_angles: int = 360,
-        seed=42,
+        n_beams: int,
+        fov_deg: float,
+        n_lookup_angles: int,
     ):
         self.n_beams = n_beams
         self.fov = jnp.radians(fov_deg)
         self.n_lookup_angles = n_lookup_angles
         self.map = Map(path, lidar_range, n_lookup_angles)
+
+        self.beam_offsets = jnp.linspace(-self.fov / 2, self.fov / 2, n_beams)
 
         cl = self.map.centerline_world  # (N, 2)
         diffs = jnp.diff(cl, axis=0, append=cl[:1])
@@ -169,9 +186,7 @@ class Environment:
         self.track_length = self.cum_dist[-1]
         self.n_waypoints = cl.shape[0]
 
-    @partial(jax.jit, static_argnums=(0,))
     def _world_to_px(self, x, y):
-        """world (x, y) → pixel (row, col) as float."""
         h = self.map.occupied.shape[0]
         ox, oy, _ = self.map.origin
         res = self.map.resolution
@@ -179,34 +194,51 @@ class Environment:
         row = h - 1 - (y - oy) / res
         return row, col
 
-    @partial(jax.jit, static_argnums=(0,))
     def _get_obsv(self, state):
-        x, y, theta, speed, prog_idx, step = state
+        x, y, theta, speed, prog_idx = state
+        prog_idx = jnp.int32(prog_idx)
         row, col = self._world_to_px(x, y)
         h, w = self.map.occupied.shape
 
-        r_idx = jnp.clip(jnp.int32(jnp.round(row)), 0, h - 1)
-        c_idx = jnp.clip(jnp.int32(jnp.round(col)), 0, w - 1)
+        r_idx = jnp.clip(round_int(row), 0, h - 1)
+        c_idx = jnp.clip(round_int(col), 0, w - 1)
 
-        pass  # TODO
+        abs_angles = theta + self.beam_offsets
+
+        lookup_idx = (
+            round_int(abs_angles / (2 * jnp.pi) * self.n_lookup_angles)
+            % self.n_lookup_angles
+        )
+
+        lidar = self.map.lookup[r_idx, c_idx, lookup_idx]
+
+        cl = self.map.centerline_world
+        track_angle = self.angles[prog_idx]
+        rel_heading = wrap_angle(theta - track_angle)
+
+        to_car = jnp.array([x, y]) - cl[prog_idx]
+        normal = jnp.array([-jnp.sin(track_angle), jnp.cos(track_angle)])
+        lat_offset = jnp.dot(to_car, normal)
+
+        return jnp.concatenate([lidar, jnp.array([speed, lat_offset, rel_heading])])
 
     @partial(jax.jit, static_argnums=(0,))
     def step(self, state, action):
         state, key = state
 
-    def _maybe_reset(self, state, done):
-        key = state[1]
-        return jax.lax.cond(done, self._reset, lambda key: state, key)
-
     def _reset(self, key):
-        new_state = jax.random.choice(key, self.map.centerline_px)
-        # TODO: add rotation
-        new_key = jax.random.split(key)[0]
-        return new_state, new_key
+        cl = self.map.centerline_world
+        idx = jax.random.randint(key, (), 0, self.n_waypoints)
+        pos = cl[idx]
+        angle = self.angles[idx]
+        return jnp.array([pos[0], pos[1], angle, 0.0, jnp.float32(idx)])
 
+    @partial(jax.jit, static_argnums=(0,))
     def reset(self, key):
-        state, key = self._reset(key)
-        return state, self._get_obsv(state)
+        key, subkey = jax.random.split(key)
+        state = self._reset(subkey)
+        obs = self._get_obsv(state)
+        return state, obs, key
 
 
 def main(
