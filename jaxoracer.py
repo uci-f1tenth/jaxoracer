@@ -9,7 +9,7 @@ import yaml
 
 
 class Map:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, lidar_range: float) -> None:
         with open(path, "r") as f:
             self.meta = yaml.safe_load(f)
 
@@ -18,14 +18,13 @@ class Map:
             raise FileNotFoundError(f"Error reading {path.parent / self.meta['image']}")
 
         self.occupied = jnp.asarray(raw < 128)
-        self.resolution = meta["resolution"]
-        self.origin = meta["origin"]
+        self.resolution = self.meta["resolution"]
+        self.origin = self.meta["origin"]
 
-        self.lookup = self._build_lookup()
+        self.lookup = self._build_lookup(lidar_range / self.resolution)
 
-    def _build_lookup(self):
+    def _build_lookup(self, max_steps: float):
         h, w = self.occupied.shape
-        max_steps = int(math.hypot(h, w))
 
         rows = jnp.arange(h)
         cols = jnp.arange(w)
@@ -62,13 +61,18 @@ class Map:
         return dist
 
 
-def main(yaml_path: Path, num_envs: int = 1024, seed: int = 42):
+def main(
+    yaml_path: Path,
+    num_envs: int = 1024,
+    seed: int = 42,
+    lidar_range: float = 20,  # m
+):
     # wandb.init(
     #     project="f1tenth-ppo-jax",
     #     name=f"jaxoracer__{seed}",
     #     save_code=True,
     # )
-    map = Map(yaml_path)
+    map = Map(yaml_path, lidar_range)
 
 
 if __name__ == "__main__":
