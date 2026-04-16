@@ -1,6 +1,7 @@
 from collections import deque
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -12,6 +13,17 @@ from scipy.signal import savgol_filter
 from skimage.morphology import skeletonize
 from typer import run
 from yaml import safe_load
+
+VEHICLE_PARAMS = SimpleNamespace(
+    tire=SimpleNamespace(p_dy1=1.0489, p_ky1=-4.9488),
+    steering=SimpleNamespace(max=0.4189, min=-0.4189, v_max=3.2, v_min=-3.2),
+    longitudinal=SimpleNamespace(a_max=9.51, v_max=20.0, v_min=-5.0, v_switch=7.319),
+    a=0.15875,
+    b=0.17145,
+    h_s=0.074,
+    m=3.74,
+    I_z=0.04712,
+)
 
 
 def steering_constraints(steering_angle, steering_velocity, p):
@@ -263,7 +275,6 @@ class Map:
             LineStrips2D([self.centerline_px], colors=[[255, 0, 0]]),
         )
 
-    # ray marching is unchanged -----------------------------------------
     @staticmethod
     def _cast_ray(dt, row, col, dc, dr, max_steps):
         h, w = dt.shape
@@ -298,10 +309,14 @@ class Environment:
         n_beams: int,
         fov_deg: float,
         n_lookup_angles: int,
+        dt: float = 1 / 60,
+        params: SimpleNamespace = VEHICLE_PARAMS,
     ):
         self.n_beams = n_beams
         self.fov = jnp.radians(fov_deg)
         self.n_lookup_angles = n_lookup_angles
+        self.sim_dt = dt
+        self.params = params
         self.map = Map(path, lidar_range, n_lookup_angles)
 
         self.beam_offsets = jnp.linspace(-self.fov / 2, self.fov / 2, n_beams)
@@ -322,16 +337,21 @@ class Environment:
         row = h - 1 - (y - oy) / res
         return row, col
 
+    # State layout: [x, y, delta, v, psi, dpsi, beta, prog_idx]
     def _get_obsv(self, state):
-        x, y, theta, speed, prog_idx = state
-        prog_idx = jnp.int32(prog_idx)
+        x = state[0]
+        y = state[1]
+        speed = state[3]
+        psi = state[4]  # yaw (body orientation)
+        prog_idx = jnp.int32(state[7])
+
         row, col = self._world_to_px(x, y)
         h, w = self.map.occupied.shape
 
         r_idx = jnp.clip(round_int(row), 0, h - 1)
         c_idx = jnp.clip(round_int(col), 0, w - 1)
 
-        abs_angles = theta + self.beam_offsets
+        abs_angles = psi + self.beam_offsets
 
         lookup_idx = (
             round_int(abs_angles / (2 * jnp.pi) * self.n_lookup_angles)
@@ -342,7 +362,7 @@ class Environment:
 
         cl = self.map.centerline_world
         track_angle = self.angles[prog_idx]
-        rel_heading = wrap_angle(theta - track_angle)
+        rel_heading = wrap_angle(psi - track_angle)
 
         to_car = jnp.array([x, y]) - cl[prog_idx]
         normal = jnp.array([-jnp.sin(track_angle), jnp.cos(track_angle)])
@@ -351,8 +371,49 @@ class Environment:
         return jnp.concatenate([lidar, jnp.array([speed, lat_offset, rel_heading])])
 
     def _step(self, state, action, key):
-        x, y, theta, speed, prog_idx = state
-        prog_idx = jnp.int32(prog_idx)
+        dyn_state = state[:7]
+        dt = self.sim_dt
+        p = self.params
+
+        k1 = vehicle_dynamics_st(dyn_state, action, p)
+        k2 = vehicle_dynamics_st(dyn_state + (dt / 2) * k1, action, p)
+        k3 = vehicle_dynamics_st(dyn_state + (dt / 2) * k2, action, p)
+        k4 = vehicle_dynamics_st(dyn_state + dt * k3, action, p)
+
+        new_dyn = dyn_state + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        new_dyn = new_dyn.at[4].set(wrap_angle(new_dyn[4]))
+        new_dyn = new_dyn.at[2].set(
+            jnp.clip(new_dyn[2], p.steering.min, p.steering.max)
+        )
+
+        row, col = self._world_to_px(new_dyn[0], new_dyn[1])
+        h, w = self.map.occupied.shape
+        r_idx = jnp.clip(round_int(row), 0, h - 1)
+        c_idx = jnp.clip(round_int(col), 0, w - 1)
+        collided = self.map.occupied[r_idx, c_idx]
+
+        # on collision: keep old pose, zero velocity / rates / slip
+        collision_state = jnp.array(
+            [
+                dyn_state[0],  # x  (old)
+                dyn_state[1],  # y  (old)
+                dyn_state[2],  # delta (old)
+                0.0,  # v  → 0
+                dyn_state[4],  # psi (old)
+                0.0,  # dpsi → 0
+                0.0,  # beta → 0
+            ]
+        )
+        safe_dyn = jnp.where(collided, collision_state, new_dyn)
+
+        cl = self.map.centerline_world
+        dists_sq = jnp.sum(
+            (cl - safe_dyn[:2]) ** 2,  # pyright: ignore[reportOperatorIssue]
+            axis=1,
+        )  # (N,)
+        new_prog_idx = jnp.argmin(dists_sq)
+
+        return jnp.concatenate([safe_dyn, jnp.array([jnp.float32(new_prog_idx)])])  # pyright: ignore[reportArgumentType]
 
     @partial(jax.jit, static_argnums=(0,))
     def step(self, state, action, key):
@@ -366,7 +427,8 @@ class Environment:
         idx = jax.random.randint(key, (), 0, self.n_waypoints)
         pos = cl[idx]
         angle = self.angles[idx]
-        return jnp.array([pos[0], pos[1], angle, 0.0, jnp.float32(idx)])
+        # [x, y, delta, v, psi, dpsi, beta, prog_idx]
+        return jnp.array([pos[0], pos[1], 0.0, 0.0, angle, 0.0, 0.0, jnp.float32(idx)])
 
     @partial(jax.jit, static_argnums=(0,))
     def reset(self, key):
@@ -376,6 +438,7 @@ class Environment:
         return state, obs, key
 
 
+# ── entry point ───────────────────────────────────────────────────────
 def main(
     yaml_path: Path,
     seed: int = 42,
