@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 
 import cv2
@@ -6,67 +7,59 @@ import jax.numpy as jnp
 import typer
 import yaml
 
-import wandb
-
 
 class Map:
     def __init__(self, path: Path) -> None:
         with open(path, "r") as f:
             self.meta = yaml.safe_load(f)
+
         raw = cv2.imread(str(path.parent / self.meta["image"]), cv2.IMREAD_GRAYSCALE)
         if raw is None:
             raise FileNotFoundError(f"Error reading {path.parent / self.meta['image']}")
-        self.occupied = jnp.asarray(raw < 128)
 
-        cast_all = jax.vmap(jax.vmap(jax.vmap(     # fmt: skip
-             Map.cast_ray, (None, None, None, 0)), # fmt: skip
-                           (None, None, 0, None)), # fmt: skip
-                           (None, 0, None, None))  # fmt: skip
-        self.lookup_table = cast_all(
-            self.occupied,
-            jnp.arange(self.occupied.shape[0]),
-            jnp.arange(self.occupied.shape[1]),
-            jnp.linspace(0, 2 * jnp.pi, 360),
-        )
+        self.occupied = jnp.asarray(raw < 128)
+        self.resolution = meta["resolution"]
+        self.origin = meta["origin"]
+
+        self.lookup = self._build_lookup()
+
+    def _build_lookup(self):
+        h, w = self.occupied.shape
+        max_steps = int(math.hypot(h, w))
+
+        rows = jnp.arange(h)
+        cols = jnp.arange(w)
+        angles = jnp.linspace(0, 2 * jnp.pi, 360)
+
+        dcs = jnp.cos(angles)
+        drs = -jnp.sin(angles)
+
+        def cast(row, col, dc, dr):
+            return self._cast_ray(self.occupied, row, col, dc, dr, max_steps)
+
+        batched = jax.vmap(cast, (None, 0, None, None))  # over col
+        batched = jax.vmap(batched, (0, None, None, None))  # over row
+        batched = jax.vmap(batched, (None, None, 0, 0))  # over angle
+
+        # (360, H, W) → (H, W, 360)
+        return batched(rows, cols, dcs, drs).transpose(1, 2, 0) * self.resolution
 
     @staticmethod
-    @jax.jit
-    def cast_ray(
-        occupied: jax.Array,
-        start_row: jax.Array,
-        start_col: jax.Array,
-        theta: jax.Array,
-    ):
-        c, s = jnp.cos(theta), -jnp.sin(theta)
+    def _cast_ray(occ, row, col, dc, dr, max_steps):
+        h, w = occ.shape
+        steps = jnp.arange(1, max_steps + 1, dtype=jnp.float32)
 
-        @jax.jit
-        def is_occ(t):
-            row = jnp.int32(jnp.round(start_row + t * c))
-            col = jnp.int32(jnp.round(start_col + t * s))
-            return (
-                col
-                < 0 | col
-                >= occupied.shape[1] | row
-                < 0 | row
-                >= occupied.shape[0] | occupied[row, col]
-            )
+        def step(best, t):
+            r = jnp.int32(jnp.round(row + t * dr))
+            c = jnp.int32(jnp.round(col + t * dc))
 
-        @jax.jit
-        def step(t):
-            return t + 1.0
+            in_bounds = (0 <= r) & (r < h) & (0 <= c) & (c < w)
+            hit = ~in_bounds | occ[jnp.clip(r, 0, h - 1), jnp.clip(c, 0, w - 1)]
 
-        # def step(carry, _):
-        #     t, hit = carry
-        #     row = jnp.int32(jnp.round(start_row + t * c))
-        #     col = jnp.int32(jnp.round(start_col + t * s))
+            return jnp.where(hit, jnp.minimum(best, t), best), None
 
-        #     hit = hit | (0 <= col) & (col < occupied.shape[1]) & (0 <= row) & (
-        #         row < occupied.shape[0]
-        #     )
-        #     t = jnp.where(hit, t, t + 1.0)
-        #     return (t, hit), None
-
-        return jax.lax.while_loop(is_occ, step, 0.0)
+        dist, _ = jax.lax.scan(step, jnp.float32(max_steps), steps)
+        return dist
 
 
 def main(yaml_path: Path, num_envs: int = 1024, seed: int = 42):
