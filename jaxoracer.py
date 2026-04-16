@@ -1,3 +1,4 @@
+import timeit
 from pathlib import Path
 
 import cv2
@@ -23,11 +24,9 @@ class Map:
         self.resolution = self.meta["resolution"]
         self.origin = self.meta["origin"]
         self.dt = jnp.asarray(distance_transform_edt(~occ).astype(np.float32))
-        self.lookup = self._build_lookup(lidar_range / self.resolution)
 
-    def _build_lookup(self, max_steps: float):
         @jax.jit
-        def run():
+        def _build_lookup(max_steps: float):
             h, w = self.occupied.shape
             angles = jnp.linspace(0, 2 * jnp.pi, 360)
 
@@ -41,7 +40,7 @@ class Map:
                 jnp.arange(h), jnp.arange(w), jnp.cos(angles), -jnp.sin(angles)
             )
 
-        return run().transpose(1, 2, 0) * self.resolution
+        self.lookup = _build_lookup(lidar_range / self.resolution)
 
     @staticmethod
     def _cast_ray(dt, row, col, dc, dr, max_steps):
