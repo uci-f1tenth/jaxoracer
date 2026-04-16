@@ -1,3 +1,4 @@
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -7,9 +8,8 @@ import numpy as np
 import rerun as rr
 import typer
 import yaml
-from scipy.interpolate import splev, splprep
 from scipy.ndimage import distance_transform_edt
-from scipy.spatial import KDTree
+from scipy.signal import savgol_filter
 from skimage.morphology import skeletonize
 
 
@@ -49,13 +49,8 @@ class Map:
         self.lookup = _build_lookup(lidar_range / self.resolution) * self.resolution
 
     def compute_centerline(self, drivable_area, smooth_window=51):
-        from collections import deque
-
-        from scipy.signal import savgol_filter
-        from skimage.morphology import skeletonize
-
         skel = skeletonize(drivable_area > 230)
-        rr.log("skeleton", rr.Image((skel * 255).astype(np.uint8)))
+        rr.log("skeleton", rr.Image((skel * 255).astype(jnp.uint8)))
 
         fg = set(map(tuple, np.argwhere(skel)))  # {(row, col), ...}
 
@@ -102,15 +97,19 @@ class Map:
         path.reverse()
 
         res = self.resolution
-        world = np.array([[c * res + ox, (h - 1 - r) * res + oy] for r, c in path])
+        world = jnp.array([[c * res + ox, (h - 1 - r) * res + oy] for r, c in path])
 
         w = min(smooth_window, len(world) // 2 * 2 - 1)
         if w >= 5:
-            world[:, 0] = savgol_filter(world[:, 0], w, 3, mode="wrap")
-            world[:, 1] = savgol_filter(world[:, 1], w, 3, mode="wrap")
+            world = jnp.column_stack(
+                [
+                    savgol_filter(world[:, 0], w, 3, mode="wrap"),
+                    savgol_filter(world[:, 1], w, 3, mode="wrap"),
+                ]
+            )
 
         self.centerline_world = world
-        self.centerline_px = np.column_stack(
+        self.centerline_px = jnp.column_stack(
             [
                 (world[:, 0] - ox) / res,
                 h - 1 - (world[:, 1] - oy) / res,
