@@ -7,7 +7,10 @@ import numpy as np
 import rerun as rr
 import typer
 import yaml
+from scipy.interpolate import splev, splprep
 from scipy.ndimage import distance_transform_edt
+from scipy.spatial import KDTree
+from skimage.morphology import skeletonize
 
 
 class Map:
@@ -19,13 +22,14 @@ class Map:
         if raw is None:
             raise FileNotFoundError(f"Error reading {path.parent / self.meta['image']}")
 
-        occ = raw < 128
+        occ = raw < 230
         self.occupied = jnp.asarray(occ)
         self.resolution = self.meta["resolution"]
         self.origin = self.meta["origin"]
         self.dt = jnp.asarray(distance_transform_edt(~occ).astype(np.float32))
         rr.log("map", rr.Image(raw))
         rr.log("dt", rr.Image(self.dt))
+        self.compute_centerline(raw)
 
         @jax.jit
         def _build_lookup(max_steps: float):
@@ -43,6 +47,79 @@ class Map:
             ).transpose(1, 2, 0)
 
         self.lookup = _build_lookup(lidar_range / self.resolution) * self.resolution
+
+    def compute_centerline(self, drivable_area, smooth_window=51):
+        from collections import deque
+
+        from scipy.signal import savgol_filter
+        from skimage.morphology import skeletonize
+
+        skel = skeletonize(drivable_area > 230)
+        rr.log("skeleton", rr.Image((skel * 255).astype(np.uint8)))
+
+        fg = set(map(tuple, np.argwhere(skel)))  # {(row, col), ...}
+
+        def adj(p):
+            r, c = p
+            return [
+                (r + dr, c + dc)
+                for dr in (-1, 0, 1)
+                for dc in (-1, 0, 1)
+                if (dr, dc) != (0, 0) and (r + dr, c + dc) in fg
+            ]
+
+        h = skel.shape[0]
+        ox, oy, _ = self.origin
+        orow, ocol = h - 1 + oy / self.resolution, -ox / self.resolution
+        start = min(fg, key=lambda p: (p[0] - orow) ** 2 + (p[1] - ocol) ** 2)
+
+        nbrs = adj(start)
+        assert len(nbrs) >= 2, f"start {start} has < 2 neighbors"
+
+        src, targets = nbrs[0], set(nbrs[1:])
+        parent = {src: src}
+        q = deque([src])
+        found = None
+        while q and found is None:
+            cur = q.popleft()
+            for n in adj(cur):
+                if n == start or n in parent:
+                    continue
+                parent[n] = cur
+                if n in targets:
+                    found = n
+                    break
+                q.append(n)
+
+        assert found is not None, "no loop found in skeleton"
+
+        path = [start]
+        p = found
+        while p != src:
+            path.append(p)
+            p = parent[p]
+        path.append(src)
+        path.reverse()
+
+        res = self.resolution
+        world = np.array([[c * res + ox, (h - 1 - r) * res + oy] for r, c in path])
+
+        w = min(smooth_window, len(world) // 2 * 2 - 1)
+        if w >= 5:
+            world[:, 0] = savgol_filter(world[:, 0], w, 3, mode="wrap")
+            world[:, 1] = savgol_filter(world[:, 1], w, 3, mode="wrap")
+
+        self.centerline_world = world
+        self.centerline_px = np.column_stack(
+            [
+                (world[:, 0] - ox) / res,
+                h - 1 - (world[:, 1] - oy) / res,
+            ]
+        )
+        rr.log(
+            "map/centerline",
+            rr.LineStrips2D([self.centerline_px], colors=[[255, 0, 0]]),
+        )
 
     @staticmethod
     def _cast_ray(dt, row, col, dc, dr, max_steps):
