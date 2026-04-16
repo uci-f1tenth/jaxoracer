@@ -1,24 +1,24 @@
 from collections import deque
+from functools import partial
 from pathlib import Path
 
-import cv2
 import jax
 import jax.numpy as jnp
-import numpy as np
-import rerun as rr
-import typer
-import yaml
+from cv2 import IMREAD_GRAYSCALE, imread
+from rerun import Image, LineStrips2D, init, log
 from scipy.ndimage import distance_transform_edt
 from scipy.signal import savgol_filter
 from skimage.morphology import skeletonize
+from typer import run
+from yaml import safe_load
 
 
 class Map:
     def __init__(self, path: Path, lidar_range: float) -> None:
         with open(path, "r") as f:
-            self.meta = yaml.safe_load(f)
+            self.meta = safe_load(f)
 
-        raw = cv2.imread(str(path.parent / self.meta["image"]), cv2.IMREAD_GRAYSCALE)
+        raw = imread(str(path.parent / self.meta["image"]), IMREAD_GRAYSCALE)
         if raw is None:
             raise FileNotFoundError(f"Error reading {path.parent / self.meta['image']}")
 
@@ -26,33 +26,32 @@ class Map:
         self.occupied = jnp.asarray(occ)
         self.resolution = self.meta["resolution"]
         self.origin = self.meta["origin"]
-        self.dt = jnp.asarray(distance_transform_edt(~occ).astype(np.float32))
-        rr.log("map", rr.Image(raw))
-        rr.log("dt", rr.Image(self.dt))
+        self.dt = jnp.asarray(distance_transform_edt(~occ))
+        log("map", Image(raw))
+        log("dt", Image(self.dt))
         self.compute_centerline(raw)
+        self.lookup = self.build_lookup(lidar_range / self.resolution) * self.resolution
 
-        @jax.jit
-        def _build_lookup(max_steps: float):
-            h, w = self.occupied.shape
-            angles = jnp.linspace(0, 2 * jnp.pi, 360)
+    @partial(jax.jit, static_argnums=(0,))
+    def build_lookup(self, max_steps: float):
+        h, w = self.occupied.shape
+        angles = jnp.linspace(0, 2 * jnp.pi, 360)
 
-            def cast(row, col, dc, dr):
-                return Map._cast_ray(self.dt, row, col, dc, dr, max_steps)
+        def cast(row, col, dc, dr):
+            return Map._cast_ray(self.dt, row, col, dc, dr, max_steps)
 
-            batched = jax.vmap(cast, (None, 0, None, None))
-            batched = jax.vmap(batched, (0, None, None, None))
-            batched = jax.vmap(batched, (None, None, 0, 0))
-            return batched(
-                jnp.arange(h), jnp.arange(w), jnp.cos(angles), -jnp.sin(angles)
-            ).transpose(1, 2, 0)
-
-        self.lookup = _build_lookup(lidar_range / self.resolution) * self.resolution
+        batched = jax.vmap(cast, (None, 0, None, None))
+        batched = jax.vmap(batched, (0, None, None, None))
+        batched = jax.vmap(batched, (None, None, 0, 0))
+        return batched(
+            jnp.arange(h), jnp.arange(w), jnp.cos(angles), -jnp.sin(angles)
+        ).transpose(1, 2, 0)
 
     def compute_centerline(self, drivable_area, smooth_window=51):
         skel = skeletonize(drivable_area > 230)
-        rr.log("skeleton", rr.Image((skel * 255).astype(jnp.uint8)))
+        log("skeleton", Image((skel * 255).astype(jnp.uint8)))
 
-        fg = set(map(tuple, np.argwhere(skel)))  # {(row, col), ...}
+        fg = set(map(tuple, jnp.argwhere(skel).tolist()))  # {(row, col), ...}
 
         def adj(p):
             r, c = p
@@ -115,9 +114,9 @@ class Map:
                 h - 1 - (world[:, 1] - oy) / res,
             ]
         )
-        rr.log(
+        log(
             "map/centerline",
-            rr.LineStrips2D([self.centerline_px], colors=[[255, 0, 0]]),
+            LineStrips2D([self.centerline_px], colors=[[255, 0, 0]]),
         )
 
     @staticmethod
@@ -141,12 +140,22 @@ class Map:
         return dist
 
 
+class Environment:
+    def __init__(self, path: Path, lidar_range: float, seed=42):
+        self.map = Map(path, lidar_range)
+
+    @partial(jax.jit, static_argnums=(0,))
+    def step(self, state, action):
+        state, key = state
+
+    # def
+
+
 def main(
     yaml_path: Path, num_envs: int = 1024, seed: int = 42, lidar_range: float = 20.0
 ):
-    rr.init("jaxoracer", spawn=True)
-    map_ = Map(yaml_path, lidar_range)
-    map_.lookup.block_until_ready()
+    init("jaxoracer", spawn=True)
+    map = Map(yaml_path, lidar_range)
 
     # h, w = map_.occupied.shape
     # ox, oy, _ = map_.origin
@@ -172,4 +181,4 @@ def main(
 
 
 if __name__ == "__main__":
-    typer.run(main)
+    run(main)
