@@ -148,7 +148,22 @@ class Environment:
     def step(self, state, action):
         state, key = state
 
-    # def
+    def _get_obsv(self, state):
+        pass  # TODO
+
+    def _maybe_reset(self, state, done):
+        key = state[1]
+        return jax.lax.cond(done, self._reset, lambda key: state, key)
+
+    def _reset(self, key):
+        new_state = jax.random.choice(key, self.map.centerline_px)
+        # TODO: add rotation
+        new_key = jax.random.split(key)[0]
+        return new_state, new_key
+
+    def reset(self, key):
+        state, key = self._reset(key)
+        return state, self._get_obsv(state)
 
 
 def main(
