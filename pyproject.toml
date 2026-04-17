@@ -6,8 +6,11 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "av>=17.0.0",
+    "distrax>=0.1.8",
+    "flax>=0.12.6",
     "jax>=0.9.2",
     "opencv-python>=4.13.0.92",
+    "optax>=0.2.8",
     "pyyaml>=6.0.3",
     "rerun-sdk>=0.31.3",
     "scikit-image>=0.26.0",

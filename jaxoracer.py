@@ -1,16 +1,22 @@
+"""Single-file PPO training for the JAX F1Tenth-style racing environment."""
+
 from collections import deque
 from functools import partial
 from pathlib import Path
 from time import perf_counter
 from types import SimpleNamespace
-from typing import NamedTuple
+from typing import NamedTuple, Sequence
 
+import distrax
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 from cv2 import IMREAD_GRAYSCALE, imread
+from flax.linen.initializers import constant, orthogonal
+from flax.training.train_state import TrainState
 from jax import lax
-from rerun import Image, LineStrips2D, init, log
 from scipy.ndimage import distance_transform_edt
 from scipy.signal import savgol_filter
 from scipy.spatial import KDTree
@@ -38,15 +44,7 @@ VEHICLE_PARAMS = SimpleNamespace(
 )
 
 
-class StepResult(NamedTuple):
-    state: jnp.ndarray
-    obs: jnp.ndarray
-    reward: jnp.ndarray
-    done: jnp.ndarray
-    key: jnp.ndarray
-
-
-def wrap(a):
+def wrap_angle(a):
     return (a + jnp.pi) % (2 * jnp.pi) - jnp.pi
 
 
@@ -91,7 +89,6 @@ def dynamics_st(x, u_raw, p):
     ua = clamp_accel(x[V], u_raw[1], p.longitudinal)
     use_kin = jnp.abs(x[V]) < 0.1
 
-    # kinematic branch
     f = dynamics_ks_cog(x, us, ua, p)
     db = (lr * us) / (
         lwb * jnp.cos(x[DELTA]) ** 2 * (1 + (jnp.tan(x[DELTA]) ** 2 * lr / lwb) ** 2)
@@ -121,7 +118,6 @@ def dynamics_st(x, u_raw, p):
             + mu / (v_safe * lwb) * C * Fnf * x[DELTA],
         ]
     )
-
     return jnp.where(use_kin, kin, dyn)
 
 
@@ -252,14 +248,6 @@ class Map:
     def w2px(self, x, y):
         return self.h - 1 - (y - self.oy) / self.res, (x - self.ox) / self.res
 
-    def log(self, raw):
-        log("map", Image(raw))
-        log("dt", Image(np.asarray(self.dt)))
-        log(
-            "map/centerline",
-            LineStrips2D([np.asarray(self.centerline_px)], colors=[[255, 0, 0]]),
-        )
-
 
 class Environment:
     def __init__(
@@ -282,14 +270,15 @@ class Environment:
         self.beam_offsets = jnp.linspace(
             -jnp.radians(fov_deg) / 2, jnp.radians(fov_deg) / 2, n_beams
         )
+        self.obs_dim = n_beams + 3  # lidar + [speed, lateral_err, heading_err]
+        self.act_dim = 2  # [steer_rate, accel]
+        self.lidar_range = lidar_range
 
     def _get_obs(self, state):
         x, y, spd, psi = state[X], state[Y], state[V], state[PSI]
         row, col = self.map.w2px(x, y)
-        r, c = (
-            jnp.clip(iround(row), 0, self.map.h - 1),
-            jnp.clip(iround(col), 0, self.map.w - 1),
-        )
+        r = jnp.clip(iround(row), 0, self.map.h - 1)
+        c = jnp.clip(iround(col), 0, self.map.w - 1)
         lidar = scan_lidar(
             self.map.dt,
             r,
@@ -303,7 +292,7 @@ class Environment:
         ta = self.map.angles[prog]
         to_car = jnp.array([x, y]) - self.map.centerline[prog]
         lat = jnp.dot(to_car, jnp.array([-jnp.sin(ta), jnp.cos(ta)]))
-        return jnp.concatenate([lidar, jnp.array([spd, lat, wrap(psi - ta)])])
+        return jnp.concatenate([lidar, jnp.array([spd, lat, wrap_angle(psi - ta)])])
 
     def _rk4(self, s, a):
         sub_dt = self.sim_dt / self.n_substeps
@@ -322,26 +311,22 @@ class Environment:
         old_prog = jnp.int32(state[PROG])
         dyn = state[:7]
         new_dyn = self._rk4(dyn, action)
-        new_dyn = new_dyn.at[PSI].set(wrap(new_dyn[PSI]))
+        new_dyn = new_dyn.at[PSI].set(wrap_angle(new_dyn[PSI]))
         new_dyn = new_dyn.at[DELTA].set(
             jnp.clip(new_dyn[DELTA], self.params.steering.min, self.params.steering.max)
         )
 
         row, col = self.map.w2px(new_dyn[X], new_dyn[Y])
-        r, c = (
-            jnp.clip(iround(row), 0, self.map.h - 1),
-            jnp.clip(iround(col), 0, self.map.w - 1),
-        )
+        r = jnp.clip(iround(row), 0, self.map.h - 1)
+        c = jnp.clip(iround(col), 0, self.map.w - 1)
         hit = self.map.occupied[r, c]
 
         frozen = jnp.array([dyn[X], dyn[Y], dyn[DELTA], 0.0, dyn[PSI], 0.0, 0.0])
         safe = jnp.where(hit, frozen, new_dyn)
 
         sr, sc = self.map.w2px(safe[X], safe[Y])
-        sr, sc = (
-            jnp.clip(iround(sr), 0, self.map.h - 1),
-            jnp.clip(iround(sc), 0, self.map.w - 1),
-        )
+        sr = jnp.clip(iround(sr), 0, self.map.h - 1)
+        sc = jnp.clip(iround(sc), 0, self.map.w - 1)
         new_prog = self.map.prog_lut[sr, sc]
         new_state = jnp.concatenate([safe, jnp.array([jnp.float32(new_prog)])])
 
@@ -357,7 +342,6 @@ class Environment:
     def step_and_reset(self, state, action, key):
         def single(s, a, k):
             ns, r, d = self._step(s, a, k)
-
             obs = self._get_obs(ns)
 
             k, sk = jax.random.split(k)
@@ -379,12 +363,10 @@ class Environment:
 
             final_s = jnp.where(d, rs, ns)
             final_obs = jnp.where(d, ro, obs)
-
             return final_s, final_obs, r, d, k
 
         return jax.vmap(single)(state, action, key)
 
-    @partial(jax.jit, static_argnums=(0,))
     def reset(self, key):
         keys = jax.random.split(key, self.num_envs)
 
@@ -409,84 +391,296 @@ class Environment:
         states, obs, keys = jax.vmap(single)(keys)
         return states, obs, keys
 
-    # @partial(jax.jit, static_argnums=(0,))
-    # def step(self, states, actions, keys):
-    #     keys = jax.vmap(lambda k: jax.random.split(k)[0])(keys)
 
-    #     def single(s, a, k):
-    #         ns, r, d = self._step(s, a, k)
-    #         obs = self._get_obs(ns)
-    #         return StepResult(ns, obs, r, d, k)
+class ActorCritic(nn.Module):
+    action_dim: int
+    activation: str = "tanh"
 
-    #     return jax.vmap(single)(states, actions, keys)
+    @nn.compact
+    def __call__(self, x):
+        act_fn = nn.relu if self.activation == "relu" else nn.tanh
 
-    # @partial(jax.jit, static_argnums=(0,))
-    # def auto_reset(self, result):
-    #     def single(s, o, r, d, k):
-    #         k, sk = jax.random.split(k)
-    #         idx = jax.random.randint(sk, (), 0, self.map.n_waypoints)
-    #         pos = self.map.centerline[idx]
-    #         rs = jnp.array(
-    #             [
-    #                 pos[0],
-    #                 pos[1],
-    #                 0.0,
-    #                 0.0,
-    #                 self.map.angles[idx],
-    #                 0.0,
-    #                 0.0,
-    #                 jnp.float32(idx),
-    #             ]
-    #         )
-    #         ro = self._get_obs(rs)
-    #         return jnp.where(d, rs, s), jnp.where(d, ro, o), k
-
-    #     states, obs, keys = jax.vmap(single)(
-    #         result.state, result.obs, result.reward, result.done, result.key
-    #     )
-    #     return states, obs, keys
-
-
-@partial(jax.jit, static_argnums=(0, 4))
-def rollout(self, states, obs, keys, n_steps):
-    def body(carry, _):
-        states, obs, keys, key = carry
-        key, k1, k2 = jax.random.split(key, 3)
-        actions = jnp.column_stack(
-            [
-                jax.random.uniform(k1, (self.num_envs,), minval=-3.2, maxval=3.2),
-                jax.random.uniform(k2, (self.num_envs,), minval=-9.51, maxval=9.51),
-            ]
+        # ── Actor ──
+        a = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
+            x
         )
-        states, obs, rewards, dones, keys = self.step_and_reset(states, actions, keys)
-        return (states, obs, keys, key), rewards
+        a = act_fn(a)
+        a = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
+            a
+        )
+        a = act_fn(a)
+        actor_mean = nn.Dense(
+            self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
+        )(a)
+        # Learnable per-action log standard deviation
+        actor_logstd = self.param(
+            "actor_logstd", nn.initializers.zeros, (self.action_dim,)
+        )
+        pi = distrax.MultivariateNormalDiag(
+            loc=actor_mean, scale_diag=jnp.exp(actor_logstd)
+        )
 
-    (states, obs, keys, _), rewards = lax.scan(
-        body, (states, obs, keys, jax.random.PRNGKey(0)), None, length=n_steps
+        # ── Critic ──
+        c = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
+            x
+        )
+        c = act_fn(c)
+        c = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
+            c
+        )
+        c = act_fn(c)
+        value = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(c)
+
+        return pi, jnp.squeeze(value, axis=-1)
+
+
+class Transition(NamedTuple):
+    done: jnp.ndarray
+    action: jnp.ndarray
+    value: jnp.ndarray
+    reward: jnp.ndarray
+    log_prob: jnp.ndarray
+    obs: jnp.ndarray
+
+
+# Action bounds
+STEER_RATE_MAX = 3.2
+ACCEL_MAX = 9.51
+ACTION_HIGH = jnp.array([STEER_RATE_MAX, ACCEL_MAX])
+ACTION_LOW = -ACTION_HIGH
+
+
+def scale_action(raw_action):
+    """Squash network output → environment action range via tanh."""
+    return jnp.tanh(raw_action) * ACTION_HIGH
+
+
+def make_train(config, env: Environment):
+    """Build a fully-jittable PPO train function for the custom Environment."""
+
+    config["NUM_UPDATES"] = int(
+        config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
-    return states, obs, keys, rewards
+    config["MINIBATCH_SIZE"] = int(
+        config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
+    )
 
+    obs_dim = env.obs_dim
+    act_dim = env.act_dim
+    lidar_range = env.lidar_range
 
-def benchmark(env, key, num_envs, warmup=10, timed=200):
-    states, obs, keys = env.reset(key)
-    k = jax.random.PRNGKey(99)
+    obs_scale = jnp.concatenate(
+        [
+            jnp.full((obs_dim - 3,), 1.0 / lidar_range),  # lidar
+            jnp.array([1.0 / 20.0, 1.0 / 2.0, 1.0 / jnp.pi]),  # speed, lat, heading
+        ]
+    )
 
-    states, obs, keys, rewards = rollout(env, states, obs, keys, warmup)
+    def linear_schedule(count):
+        frac = (
+            1.0
+            - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"]))
+            / config["NUM_UPDATES"]
+        )
+        return config["LR"] * frac
 
-    jax.block_until_ready(states)
+    def train(rng):
+        network = ActorCritic(action_dim=act_dim, activation=config["ACTIVATION"])
+        rng, _rng = jax.random.split(rng)
+        init_x = jnp.zeros(obs_dim)
+        network_params = network.init(_rng, init_x)
 
-    t0 = perf_counter()
-    states, obs, keys, rewards = rollout(env, states, obs, keys, timed)
-    jax.block_until_ready(states)
-    elapsed = perf_counter() - t0
+        if config["ANNEAL_LR"]:
+            tx = optax.chain(
+                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                optax.adam(learning_rate=linear_schedule, eps=1e-5),
+            )
+        else:
+            tx = optax.chain(
+                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                optax.adam(config["LR"], eps=1e-5),
+            )
 
-    total_steps = timed * num_envs
-    print(f"\n{'=' * 50}")
-    print(f"  {num_envs} envs × {timed} steps = {total_steps:,} total steps")
-    print(f"  {elapsed:.3f}s elapsed")
-    print(f"  {total_steps / elapsed:,.0f} steps/s")
-    print(f"  {timed / elapsed:,.1f} batches/s")
-    print(f"{'=' * 50}\n")
+        train_state = TrainState.create(
+            apply_fn=network.apply,
+            params=network_params,
+            tx=tx,
+        )
+
+        rng, _rng = jax.random.split(rng)
+        states, obs, env_keys = env.reset(_rng)
+
+        def _update_step(runner_state, unused):
+            train_state, states, obs, env_keys, rng = runner_state
+
+            def _env_step(carry, unused):
+                train_state, states, obs, env_keys, rng = carry
+
+                normed_obs = obs * obs_scale
+
+                rng, _rng = jax.random.split(rng)
+                pi, value = network.apply(train_state.params, normed_obs)
+                raw_action = pi.sample(seed=_rng)  # (num_envs, 2)
+                log_prob = pi.log_prob(raw_action)  # (num_envs,)
+
+                env_action = scale_action(raw_action)
+
+                states_new, obs_new, reward, done, env_keys_new = env.step_and_reset(
+                    states, env_action, env_keys
+                )
+
+                transition = Transition(
+                    done=done,
+                    action=raw_action,
+                    value=value,
+                    reward=reward,
+                    log_prob=log_prob,
+                    obs=normed_obs,
+                )
+                carry = (train_state, states_new, obs_new, env_keys_new, rng)
+                return carry, transition
+
+            carry, traj_batch = lax.scan(
+                _env_step,
+                (train_state, states, obs, env_keys, rng),
+                None,
+                length=config["NUM_STEPS"],
+            )
+            train_state, states, obs, env_keys, rng = carry
+
+            normed_last = obs * obs_scale
+            _, last_val = network.apply(train_state.params, normed_last)
+
+            def _calculate_gae(traj_batch, last_val):
+                def _get_advantages(gae_and_next_value, transition):
+                    gae, next_value = gae_and_next_value
+                    done, value, reward = (
+                        transition.done,
+                        transition.value,
+                        transition.reward,
+                    )
+                    delta = reward + config["GAMMA"] * next_value * (1 - done) - value
+                    gae = (
+                        delta
+                        + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
+                    )
+                    return (gae, value), gae
+
+                _, advantages = lax.scan(
+                    _get_advantages,
+                    (jnp.zeros_like(last_val), last_val),
+                    traj_batch,
+                    reverse=True,
+                    unroll=16,
+                )
+                return advantages, advantages + traj_batch.value
+
+            advantages, targets = _calculate_gae(traj_batch, last_val)
+
+            def _update_epoch(update_state, unused):
+                def _update_minibatch(train_state, batch_info):
+                    traj_batch, advantages, targets = batch_info
+
+                    def _loss_fn(params, traj_batch, gae, targets):
+                        pi, value = network.apply(params, traj_batch.obs)
+                        log_prob = pi.log_prob(traj_batch.action)
+
+                        # Value loss (clipped)
+                        value_pred_clipped = traj_batch.value + (
+                            value - traj_batch.value
+                        ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
+                        value_losses = jnp.square(value - targets)
+                        value_losses_clipped = jnp.square(value_pred_clipped - targets)
+                        value_loss = (
+                            0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
+                        )
+
+                        # Policy loss
+                        ratio = jnp.exp(log_prob - traj_batch.log_prob)
+                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                        loss_actor1 = ratio * gae
+                        loss_actor2 = (
+                            jnp.clip(
+                                ratio,
+                                1.0 - config["CLIP_EPS"],
+                                1.0 + config["CLIP_EPS"],
+                            )
+                            * gae
+                        )
+                        loss_actor = -jnp.minimum(loss_actor1, loss_actor2).mean()
+
+                        entropy = pi.entropy().mean()
+
+                        total_loss = (
+                            loss_actor
+                            + config["VF_COEF"] * value_loss
+                            - config["ENT_COEF"] * entropy
+                        )
+                        return total_loss, (value_loss, loss_actor, entropy)
+
+                    grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
+                    total_loss, grads = grad_fn(
+                        train_state.params, traj_batch, advantages, targets
+                    )
+                    train_state = train_state.apply_gradients(grads=grads)
+                    return train_state, total_loss
+
+                train_state, traj_batch, advantages, targets, rng = update_state
+                rng, _rng = jax.random.split(rng)
+                batch_size = config["NUM_STEPS"] * config["NUM_ENVS"]
+                permutation = jax.random.permutation(_rng, batch_size)
+
+                # Flatten (NUM_STEPS, NUM_ENVS, ...) → (batch_size, ...)
+                batch = (traj_batch, advantages, targets)
+                batch = jax.tree_util.tree_map(
+                    lambda x: x.reshape((batch_size,) + x.shape[2:]), batch
+                )
+                shuffled_batch = jax.tree_util.tree_map(
+                    lambda x: jnp.take(x, permutation, axis=0), batch
+                )
+                minibatches = jax.tree_util.tree_map(
+                    lambda x: jnp.reshape(
+                        x, [config["NUM_MINIBATCHES"], -1] + list(x.shape[1:])
+                    ),
+                    shuffled_batch,
+                )
+                train_state, total_loss = lax.scan(
+                    _update_minibatch, train_state, minibatches
+                )
+                update_state = (train_state, traj_batch, advantages, targets, rng)
+                return update_state, total_loss
+
+            update_state = (train_state, traj_batch, advantages, targets, rng)
+            update_state, loss_info = lax.scan(
+                _update_epoch, update_state, None, config["UPDATE_EPOCHS"]
+            )
+            train_state = update_state[0]
+            rng = update_state[-1]
+
+            avg_reward = traj_batch.reward.mean()
+            collision_frac = traj_batch.done.mean()
+            metric = {"avg_reward": avg_reward, "collision_frac": collision_frac}
+
+            if config.get("DEBUG"):
+                jax.debug.callback(
+                    lambda m: print(
+                        f"  avg_reward/step={float(m['avg_reward']):+.4f}  "
+                        f"collision_frac={float(m['collision_frac']):.4f}"
+                    ),
+                    metric,
+                )
+
+            runner_state = (train_state, states, obs, env_keys, rng)
+            return runner_state, metric
+
+        rng, _rng = jax.random.split(rng)
+        runner_state = (train_state, states, obs, env_keys, _rng)
+        runner_state, metrics = lax.scan(
+            _update_step, runner_state, None, config["NUM_UPDATES"]
+        )
+        return {"runner_state": runner_state, "metrics": metrics}
+
+    return train
 
 
 def main(
@@ -496,35 +690,88 @@ def main(
     lidar_range: float = 20.0,
     n_beams: int = 108,
     fov_deg: float = 270.0,
-    steps: int = 1000,
-    log_every: int = 100,
+    total_timesteps: int = 10_000_000,
+    num_steps: int = 128,
+    num_minibatches: int = 32,
+    update_epochs: int = 4,
+    lr: float = 3e-4,
+    gamma: float = 0.99,
+    gae_lambda: float = 0.95,
+    clip_eps: float = 0.2,
+    ent_coef: float = 0.001,
+    vf_coef: float = 0.5,
+    max_grad_norm: float = 0.5,
+    anneal_lr: bool = True,
+    debug: bool = True,
 ):
-    init("jaxoracer", spawn=True)
-    env = Environment(yaml_path, lidar_range, n_beams, fov_deg, num_envs)
-    raw = imread(str(yaml_path.parent / env.map.meta["image"]), IMREAD_GRAYSCALE)
-    env.map.log(raw)
+    print(f"Building environment from {yaml_path} …")
+    env = Environment(
+        yaml_path,
+        lidar_range=lidar_range,
+        n_beams=n_beams,
+        fov_deg=fov_deg,
+        num_envs=num_envs,
+    )
+    print(
+        f"  map {env.map.h}×{env.map.w}  |  "
+        f"track_length={env.map.track_length:.1f}m  |  "
+        f"obs_dim={env.obs_dim}  act_dim={env.act_dim}"
+    )
 
-    key = jax.random.PRNGKey(seed)
-    benchmark(env, key, num_envs)
+    config = {
+        "LR": lr,
+        "NUM_ENVS": num_envs,
+        "NUM_STEPS": num_steps,
+        "TOTAL_TIMESTEPS": total_timesteps,
+        "UPDATE_EPOCHS": update_epochs,
+        "NUM_MINIBATCHES": num_minibatches,
+        "GAMMA": gamma,
+        "GAE_LAMBDA": gae_lambda,
+        "CLIP_EPS": clip_eps,
+        "ENT_COEF": ent_coef,
+        "VF_COEF": vf_coef,
+        "MAX_GRAD_NORM": max_grad_norm,
+        "ACTIVATION": "tanh",
+        "ANNEAL_LR": anneal_lr,
+        "DEBUG": debug,
+    }
 
-    # states, obs, keys = env.reset(key)
-    # total_reward = jnp.zeros(num_envs)
+    num_updates = int(total_timesteps // num_steps // num_envs)
+    total_real = num_updates * num_steps * num_envs
+    print(
+        f"  {num_envs} envs × {num_steps} steps × {num_updates} updates "
+        f"= {total_real:,} total timesteps"
+    )
 
-    # for t in range(1, steps + 1):
-    #     key, k1, k2 = jax.random.split(key, 3)
-    #     actions = jnp.column_stack(
-    #         [
-    #             jax.random.uniform(k1, (num_envs,), minval=-3.2, maxval=3.2),
-    #             jax.random.uniform(k2, (num_envs,), minval=-9.51, maxval=9.51),
-    #         ]
-    #     )
-    #     result = env.step(states, actions, keys)
-    #     total_reward += result.reward
-    #     if t % log_every == 0:
-    #         print(
-    #             f"step {t:>5d} | avg reward/step: {float(jnp.mean(total_reward) / t):+.4f} | collisions: {int(jnp.sum(result.done))}"
-    #         )
-    #     states, obs, keys = env.auto_reset(result)
+    print("Compiling PPO (this may take a few minutes on first run) …")
+    rng = jax.random.PRNGKey(seed)
+    train_fn = jax.jit(make_train(config, env))
+
+    t0 = perf_counter()
+    out = train_fn(rng)
+    jax.block_until_ready(out)
+    elapsed = perf_counter() - t0
+
+    metrics = out["metrics"]
+    avg_r = np.asarray(metrics["avg_reward"])
+    col_f = np.asarray(metrics["collision_frac"])
+
+    print(f"\n{'=' * 60}")
+    print(f"  Training completed in {elapsed:.1f}s")
+    print(f"  {total_real / elapsed:,.0f} env steps/s")
+    print(f"  Final avg_reward/step : {avg_r[-1]:+.4f}")
+    print(f"  Final collision_frac  : {col_f[-1]:.4f}")
+    print(f"  Best  avg_reward/step : {avg_r.max():+.4f}")
+    print(f"{'=' * 60}\n")
+
+    final_params = out["runner_state"][0].params
+    save_path = yaml_path.parent / "ppo_params.npz"
+    flat_params = {
+        "/".join(map(str, k)): np.asarray(v)
+        for k, v in jax.tree_util.tree_leaves_with_path(final_params)
+    }
+    np.savez(str(save_path), **flat_params)
+    print(f"Saved parameters to {save_path}")
 
 
 if __name__ == "__main__":
