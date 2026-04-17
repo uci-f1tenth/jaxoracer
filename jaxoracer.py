@@ -1,6 +1,7 @@
 from collections import deque
 from functools import partial
 from pathlib import Path
+from time import perf_counter
 from types import SimpleNamespace
 from typing import NamedTuple
 
@@ -353,16 +354,35 @@ class Environment:
 
         return new_state, reward, hit
 
-    @partial(jax.jit, static_argnums=(0,))
-    def step(self, states, actions, keys):
-        keys = jax.vmap(lambda k: jax.random.split(k)[0])(keys)
-
+    def step_and_reset(self, state, action, key):
         def single(s, a, k):
             ns, r, d = self._step(s, a, k)
-            obs = self._get_obs(ns)
-            return StepResult(ns, obs, r, d, k)
 
-        return jax.vmap(single)(states, actions, keys)
+            obs = self._get_obs(ns)
+
+            k, sk = jax.random.split(k)
+            idx = jax.random.randint(sk, (), 0, self.map.n_waypoints)
+            pos = self.map.centerline[idx]
+            rs = jnp.array(
+                [
+                    pos[0],
+                    pos[1],
+                    0.0,
+                    0.0,
+                    self.map.angles[idx],
+                    0.0,
+                    0.0,
+                    jnp.float32(idx),
+                ]
+            )
+            ro = self._get_obs(rs)
+
+            final_s = jnp.where(d, rs, ns)
+            final_obs = jnp.where(d, ro, obs)
+
+            return final_s, final_obs, r, d, k
+
+        return jax.vmap(single)(state, action, key)
 
     @partial(jax.jit, static_argnums=(0,))
     def reset(self, key):
@@ -389,31 +409,84 @@ class Environment:
         states, obs, keys = jax.vmap(single)(keys)
         return states, obs, keys
 
-    @partial(jax.jit, static_argnums=(0,))
-    def auto_reset(self, result):
-        def single(s, o, r, d, k):
-            k, sk = jax.random.split(k)
-            idx = jax.random.randint(sk, (), 0, self.map.n_waypoints)
-            pos = self.map.centerline[idx]
-            rs = jnp.array(
-                [
-                    pos[0],
-                    pos[1],
-                    0.0,
-                    0.0,
-                    self.map.angles[idx],
-                    0.0,
-                    0.0,
-                    jnp.float32(idx),
-                ]
-            )
-            ro = self._get_obs(rs)
-            return jnp.where(d, rs, s), jnp.where(d, ro, o), k
+    # @partial(jax.jit, static_argnums=(0,))
+    # def step(self, states, actions, keys):
+    #     keys = jax.vmap(lambda k: jax.random.split(k)[0])(keys)
 
-        states, obs, keys = jax.vmap(single)(
-            result.state, result.obs, result.reward, result.done, result.key
+    #     def single(s, a, k):
+    #         ns, r, d = self._step(s, a, k)
+    #         obs = self._get_obs(ns)
+    #         return StepResult(ns, obs, r, d, k)
+
+    #     return jax.vmap(single)(states, actions, keys)
+
+    # @partial(jax.jit, static_argnums=(0,))
+    # def auto_reset(self, result):
+    #     def single(s, o, r, d, k):
+    #         k, sk = jax.random.split(k)
+    #         idx = jax.random.randint(sk, (), 0, self.map.n_waypoints)
+    #         pos = self.map.centerline[idx]
+    #         rs = jnp.array(
+    #             [
+    #                 pos[0],
+    #                 pos[1],
+    #                 0.0,
+    #                 0.0,
+    #                 self.map.angles[idx],
+    #                 0.0,
+    #                 0.0,
+    #                 jnp.float32(idx),
+    #             ]
+    #         )
+    #         ro = self._get_obs(rs)
+    #         return jnp.where(d, rs, s), jnp.where(d, ro, o), k
+
+    #     states, obs, keys = jax.vmap(single)(
+    #         result.state, result.obs, result.reward, result.done, result.key
+    #     )
+    #     return states, obs, keys
+
+
+@partial(jax.jit, static_argnums=(0, 4))
+def rollout(self, states, obs, keys, n_steps):
+    def body(carry, _):
+        states, obs, keys, key = carry
+        key, k1, k2 = jax.random.split(key, 3)
+        actions = jnp.column_stack(
+            [
+                jax.random.uniform(k1, (self.num_envs,), minval=-3.2, maxval=3.2),
+                jax.random.uniform(k2, (self.num_envs,), minval=-9.51, maxval=9.51),
+            ]
         )
-        return states, obs, keys
+        states, obs, rewards, dones, keys = self.step_and_reset(states, actions, keys)
+        return (states, obs, keys, key), rewards
+
+    (states, obs, keys, _), rewards = lax.scan(
+        body, (states, obs, keys, jax.random.PRNGKey(0)), None, length=n_steps
+    )
+    return states, obs, keys, rewards
+
+
+def benchmark(env, key, num_envs, warmup=10, timed=200):
+    states, obs, keys = env.reset(key)
+    k = jax.random.PRNGKey(99)
+
+    states, obs, keys, rewards = rollout(env, states, obs, keys, warmup)
+
+    jax.block_until_ready(states)
+
+    t0 = perf_counter()
+    states, obs, keys, rewards = rollout(env, states, obs, keys, timed)
+    jax.block_until_ready(states)
+    elapsed = perf_counter() - t0
+
+    total_steps = timed * num_envs
+    print(f"\n{'=' * 50}")
+    print(f"  {num_envs} envs × {timed} steps = {total_steps:,} total steps")
+    print(f"  {elapsed:.3f}s elapsed")
+    print(f"  {total_steps / elapsed:,.0f} steps/s")
+    print(f"  {timed / elapsed:,.1f} batches/s")
+    print(f"{'=' * 50}\n")
 
 
 def main(
@@ -432,33 +505,26 @@ def main(
     env.map.log(raw)
 
     key = jax.random.PRNGKey(seed)
-    states, obs, keys = env.reset(key)
-    ep_returns = jnp.zeros(num_envs)
-    sum_completed = 0.0
-    total_completed = 0
+    benchmark(env, key, num_envs)
 
-    for t in range(1, steps + 1):
-        key, k1, k2 = jax.random.split(key, 3)
-        actions = jnp.column_stack(
-            [
-                jax.random.uniform(k1, (num_envs,), minval=-3.2, maxval=3.2),
-                jax.random.uniform(k2, (num_envs,), minval=-9.51, maxval=9.51),
-            ]
-        )
-        result = env.step(states, actions, keys)
-        ep_returns += result.reward
-        n_done = int(jnp.sum(result.done))
-        if n_done > 0:
-            sum_completed += float(jnp.sum(jnp.where(result.done, ep_returns, 0.0)))
-            total_completed += n_done
-            ep_returns = jnp.where(result.done, 0.0, ep_returns)
-        if t % log_every == 0:
-            avg_ep = sum_completed / max(total_completed, 1)
-            print(
-                f"step {t:>5d} | completed eps: {total_completed} | "
-                f"avg ep return: {avg_ep:+.4f} | collisions: {n_done}"
-            )
-        states, obs, keys = env.auto_reset(result)
+    # states, obs, keys = env.reset(key)
+    # total_reward = jnp.zeros(num_envs)
+
+    # for t in range(1, steps + 1):
+    #     key, k1, k2 = jax.random.split(key, 3)
+    #     actions = jnp.column_stack(
+    #         [
+    #             jax.random.uniform(k1, (num_envs,), minval=-3.2, maxval=3.2),
+    #             jax.random.uniform(k2, (num_envs,), minval=-9.51, maxval=9.51),
+    #         ]
+    #     )
+    #     result = env.step(states, actions, keys)
+    #     total_reward += result.reward
+    #     if t % log_every == 0:
+    #         print(
+    #             f"step {t:>5d} | avg reward/step: {float(jnp.mean(total_reward) / t):+.4f} | collisions: {int(jnp.sum(result.done))}"
+    #         )
+    #     states, obs, keys = env.auto_reset(result)
 
 
 if __name__ == "__main__":
