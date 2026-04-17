@@ -23,6 +23,8 @@ N_RAY_ITERS = 64
 N_SUBSTEPS = 4
 COLLISION_REWARD = -10.0
 
+X, Y, DELTA, V, PSI, DPSI, BETA, PROG = range(8)
+
 VEHICLE_PARAMS = SimpleNamespace(
     tire=SimpleNamespace(p_dy1=1.0489, p_ky1=-4.9488),
     steering=SimpleNamespace(max=0.4189, min=-0.4189, v_max=3.2, v_min=-3.2),
@@ -47,18 +49,19 @@ def wrap(a):
     return (a + jnp.pi) % (2 * jnp.pi) - jnp.pi
 
 
-def ri(x):
+def iround(x):
     return jnp.int32(jnp.round(x))
 
 
-def clamp_steer(angle, vel, p):
-    c = jnp.clip(vel, p.v_min, p.v_max)
+def clamp_steer_rate(angle, rate, p):
+    c = jnp.clip(rate, p.v_min, p.v_max)
     at = ((angle <= p.min) & (c <= 0)) | ((angle >= p.max) & (c >= 0))
     return jnp.where(at, 0.0, c)
 
 
 def clamp_accel(v, a, p):
-    pl = jnp.where(v > p.v_switch, p.a_max * p.v_switch / v, p.a_max)
+    v_safe = jnp.where(v > p.v_switch, v, 1.0)
+    pl = jnp.where(v > p.v_switch, p.a_max * p.v_switch / v_safe, p.a_max)
     c = jnp.clip(a, -p.a_max, pl)
     at = ((v <= p.v_min) & (c <= 0)) | ((v >= p.v_max) & (c >= 0))
     return jnp.where(at, 0.0, c)
@@ -66,14 +69,14 @@ def clamp_accel(v, a, p):
 
 def dynamics_ks_cog(x, us, ua, p):
     lwb = p.a + p.b
-    beta = jnp.arctan(jnp.tan(x[2]) * p.b / lwb)
+    beta = jnp.arctan(jnp.tan(x[DELTA]) * p.b / lwb)
     return jnp.array(
         [
-            x[3] * jnp.cos(beta + x[4]),
-            x[3] * jnp.sin(beta + x[4]),
+            x[V] * jnp.cos(beta + x[PSI]),
+            x[V] * jnp.sin(beta + x[PSI]),
             us,
             ua,
-            x[3] * jnp.cos(beta) * jnp.tan(x[2]) / lwb,
+            x[V] * jnp.cos(beta) * jnp.tan(x[DELTA]) / lwb,
         ]
     )
 
@@ -83,40 +86,42 @@ def dynamics_st(x, u_raw, p):
     C = -p.tire.p_ky1 / p.tire.p_dy1
     lf, lr, h, m, I = p.a, p.b, p.h_s, p.m, p.I_z
     lwb = lf + lr
-    us = clamp_steer(x[2], u_raw[0], p.steering)
-    ua = clamp_accel(x[3], u_raw[1], p.longitudinal)
+    us = clamp_steer_rate(x[DELTA], u_raw[0], p.steering)
+    ua = clamp_accel(x[V], u_raw[1], p.longitudinal)
+    use_kin = jnp.abs(x[V]) < 0.1
 
-    def kin(_):
-        f = dynamics_ks_cog(x[:5], us, ua, p)
-        db = (lr * us) / (
-            lwb * jnp.cos(x[2]) ** 2 * (1 + (jnp.tan(x[2]) ** 2 * lr / lwb) ** 2)
-        )
-        ddp = (1 / lwb) * (
-            ua * jnp.cos(x[6]) * jnp.tan(x[2])
-            - x[3] * jnp.sin(x[6]) * db * jnp.tan(x[2])
-            + x[3] * jnp.cos(x[6]) * us / jnp.cos(x[2]) ** 2
-        )
-        return jnp.array([f[0], f[1], f[2], f[3], f[4], ddp, db])
+    # kinematic branch
+    f = dynamics_ks_cog(x, us, ua, p)
+    db = (lr * us) / (
+        lwb * jnp.cos(x[DELTA]) ** 2 * (1 + (jnp.tan(x[DELTA]) ** 2 * lr / lwb) ** 2)
+    )
+    ddp = (1 / lwb) * (
+        ua * jnp.cos(x[BETA]) * jnp.tan(x[DELTA])
+        - x[V] * jnp.sin(x[BETA]) * db * jnp.tan(x[DELTA])
+        + x[V] * jnp.cos(x[BETA]) * us / jnp.cos(x[DELTA]) ** 2
+    )
+    kin = jnp.array([f[0], f[1], f[2], f[3], f[4], ddp, db])
 
-    def dyn(_):
-        Fnf, Fnr = G * lr - ua * h, G * lf + ua * h
-        return jnp.array(
-            [
-                x[3] * jnp.cos(x[6] + x[4]),
-                x[3] * jnp.sin(x[6] + x[4]),
-                us,
-                ua,
-                x[5],
-                -mu * m / (x[3] * I * lwb) * (lf**2 * C * Fnf + lr**2 * C * Fnr) * x[5]
-                + mu * m / (I * lwb) * (lr * C * Fnr - lf * C * Fnf) * x[6]
-                + mu * m / (I * lwb) * lf * C * Fnf * x[2],
-                (mu / (x[3] ** 2 * lwb) * (C * Fnr * lr - C * Fnf * lf) - 1) * x[5]
-                - mu / (x[3] * lwb) * (C * Fnr + C * Fnf) * x[6]
-                + mu / (x[3] * lwb) * C * Fnf * x[2],
-            ]
-        )
+    v_safe = jnp.where(use_kin, 1.0, x[V])
+    Fnf = G * lr - ua * h
+    Fnr = G * lf + ua * h
+    dyn = jnp.array(
+        [
+            x[V] * jnp.cos(x[BETA] + x[PSI]),
+            x[V] * jnp.sin(x[BETA] + x[PSI]),
+            us,
+            ua,
+            x[DPSI],
+            -mu * m / (v_safe * I * lwb) * (lf**2 * C * Fnf + lr**2 * C * Fnr) * x[DPSI]
+            + mu * m / (I * lwb) * (lr * C * Fnr - lf * C * Fnf) * x[BETA]
+            + mu * m / (I * lwb) * lf * C * Fnf * x[DELTA],
+            (mu / (v_safe**2 * lwb) * (C * Fnr * lr - C * Fnf * lf) - 1) * x[DPSI]
+            - mu / (v_safe * lwb) * (C * Fnr + C * Fnf) * x[BETA]
+            + mu / (v_safe * lwb) * C * Fnf * x[DELTA],
+        ]
+    )
 
-    return lax.cond(jnp.abs(x[3]) < 0.1, kin, dyn, operand=None)
+    return jnp.where(use_kin, kin, dyn)
 
 
 def cast_ray(dt_map, row, col, dc, dr, max_steps, n_iters):
@@ -124,7 +129,7 @@ def cast_ray(dt_map, row, col, dc, dr, max_steps, n_iters):
 
     def step(state, _):
         t, done = state
-        r, c = ri(row + t * dr), ri(col + t * dc)
+        r, c = iround(row + t * dr), iround(col + t * dc)
         ib = (0 <= r) & (r < h) & (0 <= c) & (c < w)
         d = jnp.where(ib, dt_map[jnp.clip(r, 0, h - 1), jnp.clip(c, 0, w - 1)], 0.0)
         hit = (d < 1.0) | ~ib
@@ -278,11 +283,11 @@ class Environment:
         )
 
     def _get_obs(self, state):
-        x, y, _, spd, psi = state[0], state[1], state[2], state[3], state[4]
+        x, y, spd, psi = state[X], state[Y], state[V], state[PSI]
         row, col = self.map.w2px(x, y)
         r, c = (
-            jnp.clip(ri(row), 0, self.map.h - 1),
-            jnp.clip(ri(col), 0, self.map.w - 1),
+            jnp.clip(iround(row), 0, self.map.h - 1),
+            jnp.clip(iround(col), 0, self.map.w - 1),
         )
         lidar = scan_lidar(
             self.map.dt,
@@ -313,28 +318,28 @@ class Environment:
         return lax.fori_loop(0, self.n_substeps, body, s)
 
     def _step(self, state, action, key):
-        old_prog = jnp.int32(state[7])
+        old_prog = jnp.int32(state[PROG])
         dyn = state[:7]
         new_dyn = self._rk4(dyn, action)
-        new_dyn = new_dyn.at[4].set(wrap(new_dyn[4]))
-        new_dyn = new_dyn.at[2].set(
-            jnp.clip(new_dyn[2], self.params.steering.min, self.params.steering.max)
+        new_dyn = new_dyn.at[PSI].set(wrap(new_dyn[PSI]))
+        new_dyn = new_dyn.at[DELTA].set(
+            jnp.clip(new_dyn[DELTA], self.params.steering.min, self.params.steering.max)
         )
 
-        row, col = self.map.w2px(new_dyn[0], new_dyn[1])
+        row, col = self.map.w2px(new_dyn[X], new_dyn[Y])
         r, c = (
-            jnp.clip(ri(row), 0, self.map.h - 1),
-            jnp.clip(ri(col), 0, self.map.w - 1),
+            jnp.clip(iround(row), 0, self.map.h - 1),
+            jnp.clip(iround(col), 0, self.map.w - 1),
         )
         hit = self.map.occupied[r, c]
 
-        frozen = jnp.array([dyn[0], dyn[1], dyn[2], 0.0, dyn[4], 0.0, 0.0])
+        frozen = jnp.array([dyn[X], dyn[Y], dyn[DELTA], 0.0, dyn[PSI], 0.0, 0.0])
         safe = jnp.where(hit, frozen, new_dyn)
 
-        sr, sc = self.map.w2px(safe[0], safe[1])
+        sr, sc = self.map.w2px(safe[X], safe[Y])
         sr, sc = (
-            jnp.clip(ri(sr), 0, self.map.h - 1),
-            jnp.clip(ri(sc), 0, self.map.w - 1),
+            jnp.clip(iround(sr), 0, self.map.h - 1),
+            jnp.clip(iround(sc), 0, self.map.w - 1),
         )
         new_prog = self.map.prog_lut[sr, sc]
         new_state = jnp.concatenate([safe, jnp.array([jnp.float32(new_prog)])])
@@ -428,7 +433,9 @@ def main(
 
     key = jax.random.PRNGKey(seed)
     states, obs, keys = env.reset(key)
-    total_reward = jnp.zeros(num_envs)
+    ep_returns = jnp.zeros(num_envs)
+    sum_completed = 0.0
+    total_completed = 0
 
     for t in range(1, steps + 1):
         key, k1, k2 = jax.random.split(key, 3)
@@ -439,10 +446,17 @@ def main(
             ]
         )
         result = env.step(states, actions, keys)
-        total_reward += result.reward
+        ep_returns += result.reward
+        n_done = int(jnp.sum(result.done))
+        if n_done > 0:
+            sum_completed += float(jnp.sum(jnp.where(result.done, ep_returns, 0.0)))
+            total_completed += n_done
+            ep_returns = jnp.where(result.done, 0.0, ep_returns)
         if t % log_every == 0:
+            avg_ep = sum_completed / max(total_completed, 1)
             print(
-                f"step {t:>5d} | avg reward/step: {float(jnp.mean(total_reward) / t):+.4f} | collisions: {int(jnp.sum(result.done))}"
+                f"step {t:>5d} | completed eps: {total_completed} | "
+                f"avg ep return: {avg_ep:+.4f} | collisions: {n_done}"
             )
         states, obs, keys = env.auto_reset(result)
 
